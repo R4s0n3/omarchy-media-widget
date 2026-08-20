@@ -7,6 +7,8 @@ desktop.
 Originally a standalone C++/Qt desktop app, this is the omarchy plugin
 rewrite. It is pure QML + shell scripts and needs no separate runtime.
 
+![Media widget on the desktop](assets/widget-screenshot.png)
+
 ## Features
 
 - Plays photos, GIFs and videos (mp4, mov, m4v, webm, mkv, avi, jpg, png,
