@@ -536,7 +536,7 @@ Item {
       // ---- context menu ---------------------------------------------------
       // Solid theme-colored panel, full card width, half card height,
       // anchored bottom-right of the card. Two pages: main actions and the
-      // size choices, laid out in two columns so every row stays visible.
+      // size choices. Pages scroll when the rows don't fit.
       Rectangle {
         id: contextMenu
         visible: false
@@ -545,105 +545,128 @@ Item {
         width: parent.width / 2
         height: parent.height
         z: 10
-        radius: 12
         color: Qt.rgba(Color.menu.background.r, Color.menu.background.g,
                        Color.menu.background.b, 1.0)
         border.color: Color.menu.border
         border.width: 1
 
-        Column {
+        Flickable {
           id: mainPage
           visible: true
           anchors.fill: parent
           anchors.margins: 6
+          contentHeight: mainColumn.height
+          clip: true
 
-          MenuRow {
-            text: root.paused ? "Resume" : "Pause"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: { contextMenu.visible = false; root.togglePause() }
-          }
-          MenuRow {
-            text: "Previous"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: { contextMenu.visible = false; root.prev() }
-          }
-          MenuRow {
-            text: "Next"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: { contextMenu.visible = false; root.next() }
-          }
-          MenuRow {
-            text: "Shuffle: " + (root.shuffle ? "on" : "off")
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: {
-              root.shuffle = !root.shuffle
-              root.persistEntry()
+          Column {
+            id: mainColumn
+            width: mainPage.width
+
+            MenuRow {
+              text: root.paused ? "Resume" : "Pause"
+              rowHeight: 30
+              onTriggered: { contextMenu.visible = false; root.togglePause() }
             }
-          }
-          MenuRow {
-            text: "Ken Burns: " + (root.effects ? "on" : "off")
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: {
-              root.effects = !root.effects
-              root.persistEntry()
+            MenuRow {
+              text: "Previous"
+              rowHeight: 30
+              onTriggered: { contextMenu.visible = false; root.prev() }
             }
-          }
-          MenuSliderRow {
-            text: "Radius: " + Math.round(root.radius) + "px"
-            from: 0
-            to: root.size / 2
-            stepSize: 4
-            value: root.radius
-            rowHeight: (contextMenu.height - 12) / 10
-            onSliderMoved: root.radius = v
-            onCommitted: root.persistEntry()
-          }
-          MenuRow {
-            text: root.picking ? "Picking folder…" : "Pick folder…"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: root.pickFolder()
-          }
-          MenuRow {
-            text: "Open folder"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: { contextMenu.visible = false; root.openFolder() }
-          }
-          MenuRow {
-            text: "Size…"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: { mainPage.visible = false; sizePage.visible = true }
-          }
-          MenuRow {
-            text: "Hide widget"
-            rowHeight: (contextMenu.height - 12) / 10
-            onTriggered: { contextMenu.visible = false; root.requestClose() }
+            MenuRow {
+              text: "Next"
+              rowHeight: 30
+              onTriggered: { contextMenu.visible = false; root.next() }
+            }
+            MenuRow {
+              text: "Shuffle: " + (root.shuffle ? "on" : "off")
+              rowHeight: 30
+              onTriggered: {
+                root.shuffle = !root.shuffle
+                root.persistEntry()
+              }
+            }
+            MenuRow {
+              text: "Ken Burns: " + (root.effects ? "on" : "off")
+              rowHeight: 30
+              onTriggered: {
+                root.effects = !root.effects
+                root.persistEntry()
+              }
+            }
+            MenuSliderRow {
+              text: "Radius: " + Math.round(root.radius) + "px"
+              from: 0
+              to: root.size / 2
+              stepSize: 4
+              value: root.radius
+              rowHeight: 30
+              onSliderMoved: root.radius = v
+              onCommitted: root.persistEntry()
+            }
+            MenuSliderRow {
+              text: "Interval: " + Math.round(root.intervalSec / 60) + " min"
+              from: 300
+              to: 3600
+              stepSize: 60
+              value: root.intervalSec
+              rowHeight: 30
+              onSliderMoved: root.intervalSec = v
+              onCommitted: root.persistEntry()
+            }
+            MenuRow {
+              text: root.picking ? "Picking folder…" : "Pick folder…"
+              rowHeight: 30
+              onTriggered: root.pickFolder()
+            }
+            MenuRow {
+              text: "Open folder"
+              rowHeight: 30
+              onTriggered: { contextMenu.visible = false; root.openFolder() }
+            }
+            MenuRow {
+              text: "Size…"
+              rowHeight: 30
+              onTriggered: { mainPage.visible = false; sizePage.visible = true }
+            }
+            MenuRow {
+              text: "Hide widget"
+              rowHeight: 30
+              onTriggered: { contextMenu.visible = false; root.requestClose() }
+            }
           }
         }
 
-        Column {
+        Flickable {
           id: sizePage
           visible: false
           anchors.fill: parent
           anchors.margins: 6
+          contentHeight: sizeColumn.height
+          clip: true
 
-          MenuRow {
-            text: "← Back"
-            rowHeight: (contextMenu.height - 12) / 5
-            onTriggered: { sizePage.visible = false; mainPage.visible = true }
-          }
-          Repeater {
-            model: [240, 360, 480, 720]
-            delegate: MenuRow {
-              required property int modelData
-              text: modelData + "px"
-              checked: root.size === modelData
-              rowHeight: (contextMenu.height - 12) / 5
-              onTriggered: {
-                root.size = modelData
-                root.radius = Math.min(root.radius, root.size / 2)
-                root.persistEntry()
-                sizePage.visible = false
-                mainPage.visible = true
+          Column {
+            id: sizeColumn
+            width: sizePage.width
+
+            MenuRow {
+              text: "← Back"
+              rowHeight: 30
+              onTriggered: { sizePage.visible = false; mainPage.visible = true }
+            }
+            Repeater {
+              model: [240, 360, 480, 720]
+              delegate: MenuRow {
+                required property int modelData
+                text: modelData + "px"
+                checked: root.size === modelData
+                rowHeight: 30
+                onTriggered: {
+                  root.size = modelData
+                  root.radius = Math.min(root.radius, root.size / 2)
+                  root.persistEntry()
+                  sizePage.visible = false
+                  mainPage.visible = true
+                }
               }
             }
           }

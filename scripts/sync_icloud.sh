@@ -23,7 +23,7 @@ TZ=${TZ:-Europe/Paris}
 convert_heic_to_jpeg=true
 photo_library=${lib:-SharedSync-LIBRARY_ID}
 folder_structure=none
-download_path=/home/ras/iCloud
+download_path=/home/${USER:-$(id -un)}/iCloud
 download_interval=86400
 EOF
     fi
@@ -36,7 +36,7 @@ ensure_running() {
         docker run -d --name "$CONTAINER" --restart unless-stopped \
             --env-file "$(env_file)" \
             --volume "$VOLUME:/config" \
-            --volume "$DOWNLOAD_DIR:/home/ras/iCloud" \
+            --volume "$DOWNLOAD_DIR:/home/${USER:-$(id -un)}/iCloud" \
             "$IMAGE"
         log "container started, waiting for it to initialise..."
         sleep 6
