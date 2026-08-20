@@ -91,7 +91,9 @@ Item {
   function applySettings() {
     var e = root.readEntry()
     root.folder = String(e.folder || "") || Quickshell.env("HOME") + "/Pictures/mediawidget"
-    root.intervalSec = Math.max(300, Number(e.interval) || 300)
+    // Honor hand-edited values; only clamp to sane bounds. The menu slider
+    // still constrains interactive changes to 300..3600s.
+    root.intervalSec = Math.min(86400, Math.max(5, Number(e.interval) || 300))
     root.size = Math.min(1200, Math.max(160, Number(e.size) || 360))
     root.radius = Math.min(Number(e.radius) || 0, root.size / 2)
     root.shuffle = e.shuffle === true
@@ -515,6 +517,7 @@ Item {
         property int startY: 0
         property int startRight: 0
         property int startBottom: 0
+        property bool dragged: false
         onPressed: function(mouse) {
           card.forceActiveFocus()
           contextMenu.visible = false
@@ -523,14 +526,17 @@ Item {
           startY = g.y
           startRight = root.marginRight
           startBottom = root.marginBottom
+          dragged = false
         }
         onPositionChanged: function(mouse) {
           if (!pressed) return
           var g = dragArea.mapToGlobal(mouse.x, mouse.y)
+          if (g.x !== startX || g.y !== startY) dragged = true
           root.marginRight = Math.max(0, startRight - (g.x - startX))
           root.marginBottom = Math.max(0, startBottom - (g.y - startY))
         }
-        onReleased: root.persistEntry()
+        // Only a real drag (not a plain click) rewrites the saved position.
+        onReleased: if (dragged) root.persistEntry()
       }
 
       // ---- context menu ---------------------------------------------------

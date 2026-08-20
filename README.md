@@ -26,10 +26,56 @@ rewrite. It is pure QML + shell scripts and needs no separate runtime.
 
 ## Install
 
+Requires omarchy with the shell running. The plugin is cloned into
+`~/.config/omarchy/plugins/`, validated against the plugin schema, and then
+enabled (the plugin manager asks for confirmation and where to place the bar
+button):
+
 ```
-omarchy plugin install <path-or-url-to-this-plugin>
-omarchy plugin enable io.github.ras.mediawidget
+omarchy plugin add https://github.com/ras/widget-omarchy.git --enable
 ```
+
+- `--enable` also places the bar button; without it, run
+  `omarchy plugin enable io.github.ras.mediawidget` afterwards.
+- `--yes` skips the confirmation prompt (scripted installs).
+- `omarchy plugin install` is an alias of `add`.
+- `add` takes a git URL only. For development against a local checkout, see
+  Development below.
+
+The add command rescans the plugin registry automatically; if the bar button
+does not appear, restart omarchy-shell.
+
+## Removal
+
+```
+omarchy plugin remove io.github.ras.mediawidget --yes
+```
+
+This asks for confirmation, disables the plugin (which removes its entry from
+`~/.config/omarchy/shell.json`), unloads it from the running shell, and
+deletes the plugin folder. Non-git installations are backed up to
+`~/.config/omarchy/plugins/.io.github.ras.mediawidget.bak.<timestamp>` before
+removal.
+
+Optional cleanup of files the plugin may have created while in use:
+
+```
+rm -rf ~/Pictures/mediawidget      # default media folder (if you want it gone)
+rm -rf ~/.config/mediawidget       # iCloud sync env (only if you used it)
+```
+
+## Configuration safety
+
+- The plugin only ever touches its own `io.github.ras.mediawidget` entry in
+  `~/.config/omarchy/shell.json`; it never modifies other bar/widget/plugin
+  settings.
+- That entry is written only on explicit user actions: dragging the widget,
+  picking a folder, toggling shuffle/Ken Burns, committing a slider, or
+  choosing a size. A plain click that moves nothing writes nothing.
+- Hand-edited values are honored: for example an `interval` below the menu
+  slider's 300 s minimum is not reset to 300 by a later save.
+- `omarchy plugin` commands (add/enable/remove) always prompt for
+  confirmation before touching anything.
 
 ## Settings
 
@@ -40,6 +86,7 @@ Stored in the `bar.layout.right` entry of `~/.config/omarchy/shell.json`:
 | `folder`       | `~/Pictures/mediawidget`   | Media folder (recursive)         |
 | `interval`     | `300`                      | Slideshow interval in seconds    |
 | `size`         | `360`                      | Widget size in pixels            |
+| `radius`       | `0`                        | Corner radius in pixels (0..size/2) |
 | `shuffle`      | `false`                    | Random order                     |
 | `effects`      | `true`                     | Fade transition between items    |
 | `marginRight`  | `48`                       | Distance from right screen edge  |
