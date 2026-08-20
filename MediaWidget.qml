@@ -5,6 +5,7 @@ import QtMultimedia
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import Quickshell.Hyprland
 import qs.Commons
 import "MediaModel.js" as MediaModel
 
@@ -30,11 +31,12 @@ Item {
     root.pluginId = String(root.manifest.id || "")
     root.pluginDir = String(root.manifest.__sourceDir || "")
     root.started = true
-    console.log("MediaWidget started:", root.pluginId, "dir:", root.pluginDir, "media:", root.files.length)
+    console.log("MediaWidget v2 started:", root.pluginId, "dir:", root.pluginDir, "media:", root.files.length)
     root.applySettings()
     root.ensureFolder()
     root.runScan()
     root.restartWatcher()
+    root.connectLockService()
   }
 
   onManifestChanged: root.startAfterInjection()
@@ -43,16 +45,48 @@ Item {
 
   // ---- visibility lifecycle --------------------------------------------
   property bool opened: false
+  // True while the session lock screen is up. The widget is hidden and
+  // playback suspended so it never overlaps the lock screen.
+  property bool locked: false
 
   function open(payloadJson) {
     opened = true
-    window.visible = true
+    window.visible = !root.locked
     Qt.callLater(function() { card.forceActiveFocus() })
   }
 
   function close() {
     opened = false
     window.visible = false
+  }
+
+  function setLocked(value) {
+    value = value === true
+    if (root.locked === value) return
+    root.locked = value
+    window.visible = root.opened && !root.locked
+    if (root.locked) {
+      if (videoItem.visible) videoPlayer.pause()
+    } else if (!root.paused && root.files.length > 0 && videoItem.visible) {
+      videoPlayer.play()
+    }
+  }
+
+  // Track the omarchy lock service (omarchy.lock) so the widget hides the
+  // moment the in-shell session lock engages. The service loads asynchronously,
+  // so retry until it appears; `lockactive` IPC events cover external locks.
+  property var lockService: null
+  property int lockServiceAttempts: 0
+
+  function connectLockService() {
+    if (root.lockService || root.lockServiceAttempts > 30) return
+    root.lockServiceAttempts++
+    if (!root.shell || typeof root.shell.serviceFor !== "function") return
+    var svc = root.shell.serviceFor("omarchy.lock")
+    if (!svc) return
+    root.lockService = svc
+    lockServiceConn.target = svc
+    root.setLocked(svc.locked)
   }
 
   function requestClose() {
@@ -62,6 +96,7 @@ Item {
 
   // Debug/introspection via `omarchy-shell shell call <id> <method> ''`.
   function widgetState() { return root.opened ? "open" : "closed" }
+  function lockedState() { return root.locked ? "locked" : "unlocked" }
   function mediaCount() { return String(root.files.length) }
   function currentMedia() { return root.currentBase }
   function mediaFolder() { return root.folder }
@@ -269,7 +304,7 @@ Item {
   // ---- window -------------------------------------------------------------
   PanelWindow {
     id: window
-    visible: root.opened
+    visible: root.opened && !root.locked
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omarchy-mediawidget"
@@ -334,7 +369,7 @@ Item {
           anchors.fill: parent
           fillMode: Image.PreserveAspectCrop
           visible: false
-          paused: root.paused
+          paused: root.paused || root.locked
           onCurrentFrameChanged: {
             if (root.pendingAdvance && currentFrame === 0 && visible) {
               root.pendingAdvance = false
@@ -383,7 +418,7 @@ Item {
 
         SequentialAnimation {
           id: kenBurns
-          running: root.effects && photo.visible && !root.paused
+          running: root.effects && photo.visible && !root.paused && !root.locked
           loops: Animation.Infinite
           NumberAnimation { target: photo; property: "scale"; from: 1.0; to: 1.08; duration: 45000; easing.type: Easing.InOutSine }
           NumberAnimation { target: photo; property: "scale"; from: 1.08; to: 1.0; duration: 45000; easing.type: Easing.InOutSine }
@@ -726,8 +761,33 @@ Item {
     id: slideTimer
     interval: root.intervalSec * 1000
     repeat: true
-    running: root.files.length > 0 && !root.paused
+    running: root.files.length > 0 && !root.paused && !root.locked
     onTriggered: root.onTimerExpired()
+  }
+
+  // Retry connecting to the lock service until it is loaded.
+  Timer {
+    id: lockServiceRetry
+    interval: 200
+    repeat: true
+    running: root.started && !root.lockService && root.lockServiceAttempts <= 30
+    onTriggered: root.connectLockService()
+  }
+
+  Connections {
+    id: lockServiceConn
+    function onLockedChanged() {
+      root.setLocked(root.lockService.locked)
+    }
+  }
+
+  // External locks (e.g. hyprlock) emit `lockactive` on the Hyprland IPC
+  // event socket; hide the widget for those too.
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event.name === "lockactive") root.setLocked(event.data === "1")
+    }
   }
 
   Component.onCompleted: {
