@@ -48,6 +48,8 @@ Item {
     to: row.to
     stepSize: row.stepSize
     value: row.value
+    focusPolicy: Qt.StrongFocus
+    Accessible.name: row.text
     onMoved: row.sliderMoved(value)
     onPressedChanged: if (!pressed) row.committed()
 

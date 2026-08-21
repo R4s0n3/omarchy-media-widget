@@ -1,7 +1,8 @@
 import QtQuick
 import qs.Commons
 
-// Single row of the widget's context menu.
+// Single row of the widget's context menu. Mouse and keyboard driven:
+// tab focus, Enter/Space activation, and a visible focus ring.
 Item {
   id: row
   property string text: ""
@@ -13,10 +14,30 @@ Item {
   width: parent.width
   height: row.rowHeight
 
+  activeFocusOnTab: true
+  Accessible.role: Accessible.Button
+  Accessible.name: row.text
+  Accessible.checked: row.checked
+  Keys.onPressed: function(event) {
+    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+      row.triggered()
+      event.accepted = true
+    }
+  }
+
   Rectangle {
     anchors.fill: parent
     radius: 6
-    color: row.containsMouse ? Color.menu.selectedBackground : "transparent"
+    color: row.containsMouse || row.activeFocus ? Color.menu.selectedBackground : "transparent"
+  }
+
+  Rectangle {
+    anchors.fill: parent
+    radius: 6
+    border.width: 1
+    border.color: Style.focusBorderColor
+    color: "transparent"
+    visible: row.activeFocus
   }
 
   Text {
@@ -24,7 +45,7 @@ Item {
     anchors.leftMargin: 10
     anchors.verticalCenter: parent.verticalCenter
     text: row.text
-    color: row.containsMouse ? Color.menu.selectedText : Color.menu.text
+    color: row.containsMouse || row.activeFocus ? Color.menu.selectedText : Color.menu.text
     font.family: Style.font.family
     font.pixelSize: Style.font.body
     elide: Text.ElideRight

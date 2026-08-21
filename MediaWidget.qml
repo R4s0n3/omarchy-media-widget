@@ -33,60 +33,71 @@ Item {
     root.started = true
     console.log("MediaWidget v2 started:", root.pluginId, "dir:", root.pluginDir, "media:", root.files.length)
     root.applySettings()
-    root.ensureFolder()
     root.runScan()
     root.restartWatcher()
     root.connectLockService()
+    hyprLockProbe.running = true
   }
 
   onManifestChanged: root.startAfterInjection()
   onShellChanged: root.startAfterInjection()
   onPluginRegistryChanged: root.startAfterInjection()
 
-  // ---- visibility lifecycle --------------------------------------------
+  // ---- visibility + playback lifecycle -----------------------------------
   property bool opened: false
-  // True while the session lock screen is up. The widget is hidden and
-  // playback suspended so it never overlaps the lock screen.
-  property bool locked: false
+
+  // Lock state is tracked independently for the omarchy lock service and for
+  // Hyprland's `lockactive` IPC, then combined; the last event never wins.
+  property bool serviceLocked: false
+  property bool hyprLocked: false
+  readonly property bool locked: MediaModel.lockCombined(root.serviceLocked, root.hyprLocked)
+  // The window stays hidden until at least one lock source has answered, so
+  // the widget can never flash over a lock screen it did not see yet.
+  property bool lockStateKnown: false
+
+  // Single source of truth for every playback consumer: the interval timer,
+  // the MediaPlayer, the GIF animation, and the Ken Burns zoom all follow
+  // this one binding instead of being driven by imperative assignments.
+  readonly property bool playbackActive: MediaModel.playbackActive(root.opened, root.paused, root.locked)
 
   function open(payloadJson) {
-    opened = true
-    window.visible = !root.locked
-    Qt.callLater(function() { card.forceActiveFocus() })
+    root.opened = true
+    // No focus steal: keyboard shortcuts are scoped to deliberate card focus.
   }
 
   function close() {
-    opened = false
-    window.visible = false
+    root.opened = false
   }
 
-  function setLocked(value) {
-    value = value === true
-    if (root.locked === value) return
-    root.locked = value
-    window.visible = root.opened && !root.locked
-    if (root.locked) {
-      if (videoItem.visible) videoPlayer.pause()
-    } else if (!root.paused && root.files.length > 0 && videoItem.visible) {
-      videoPlayer.play()
+  onPlaybackActiveChanged: {
+    if (root.playbackActive) root.restartTimer()
+    if (videoItem.visible && videoPlayer.source !== "") {
+      if (root.playbackActive) videoPlayer.play()
+      else videoPlayer.pause()
     }
   }
 
+  // Switching the effect off mid-zoom would leave the photo at a scaled
+  // state; kenBurns.running is a binding and cannot write properties, so the
+  // reset lives here, next to the `effects` property it depends on.
+  onEffectsChanged: {
+    if (!root.effects) photo.scale = 1.0
+  }
+
   // Track the omarchy lock service (omarchy.lock) so the widget hides the
-  // moment the in-shell session lock engages. The service loads asynchronously,
-  // so retry until it appears; `lockactive` IPC events cover external locks.
+  // moment the in-shell session lock engages. The service loads asynchronously
+  // and can be recreated when the plugin is reloaded, so a poller keeps the
+  // connection current.
   property var lockService: null
-  property int lockServiceAttempts: 0
 
   function connectLockService() {
-    if (root.lockService || root.lockServiceAttempts > 30) return
-    root.lockServiceAttempts++
     if (!root.shell || typeof root.shell.serviceFor !== "function") return
     var svc = root.shell.serviceFor("omarchy.lock")
     if (!svc) return
     root.lockService = svc
     lockServiceConn.target = svc
-    root.setLocked(svc.locked)
+    root.serviceLocked = svc.locked === true
+    root.lockStateKnown = true
   }
 
   function requestClose() {
@@ -108,8 +119,11 @@ Item {
   property real radius: 0
   property bool shuffle: false
   property bool effects: true
+  property bool autoplay: true
   property int marginRight: 48
   property int marginBottom: 48
+  readonly property int defaultMarginRight: 48
+  readonly property int defaultMarginBottom: 48
 
   function readEntry() {
     var cfg = shell && shell.shellConfig ? shell.shellConfig : null
@@ -123,6 +137,13 @@ Item {
     return {}
   }
 
+  // A zero margin is a valid choice; only missing/invalid values fall back.
+  function readMargin(v, dflt) {
+    if (v === undefined || v === null || v === "") return dflt
+    var n = Number(v)
+    return isFinite(n) ? n : dflt
+  }
+
   function applySettings() {
     var e = root.readEntry()
     root.folder = String(e.folder || "") || Quickshell.env("HOME") + "/Pictures/mediawidget"
@@ -133,8 +154,11 @@ Item {
     root.radius = Math.min(Number(e.radius) || 0, root.size / 2)
     root.shuffle = e.shuffle === true
     root.effects = e.effects !== false
-    root.marginRight = Number(e.marginRight) || 48
-    root.marginBottom = Number(e.marginBottom) || 48
+    root.autoplay = e.autoplay !== false
+    // Zero is a valid margin; only missing/invalid values fall back. Both
+    // margins are clamped so the card always stays on screen.
+    root.marginRight = root.clampRight(root.readMargin(e.marginRight, root.defaultMarginRight))
+    root.marginBottom = root.clampBottom(root.readMargin(e.marginBottom, root.defaultMarginBottom))
   }
 
   function persistEntry() {
@@ -146,6 +170,7 @@ Item {
       radius: root.radius,
       shuffle: root.shuffle,
       effects: root.effects,
+      autoplay: root.autoplay,
       marginRight: root.marginRight,
       marginBottom: root.marginBottom
     })
@@ -156,115 +181,225 @@ Item {
   property int index: -1
   property bool paused: false
   property string currentBase: ""
-  property int failCount: 0
+  property string currentPath: ""
+  // Paths that failed to load, keyed by full path. An entry is removed only
+  // after the file loads successfully (or the folder is rescanned), so a
+  // broken file cannot hot-loop the slideshow.
+  property var failedPaths: ({})
   property bool pendingAdvance: false
   property bool picking: false
+  property var history: []
+  // Poll-based countdown. `advanceDueAt` is a plain timestamp, so nothing
+  // ever needs to sever the slideTimer.running binding to "restart".
+  property double advanceDueAt: 0
+  property double gifLastFrameChange: 0
+  property int gifLastFrame: -1
+  property bool gifWrapped: false
+  // Transient status messages (picker results, scan errors, …).
+  property string flash: ""
+  property bool flashError: false
+  property bool flashActive: false
 
-  function restartTimer() { slideTimer.restart() }
+  // ---- scanning ------------------------------------------------------------
+  // Every scan is tagged with the folder generation it was started for;
+  // results from a previous folder are discarded. If changes arrive while a
+  // scan is running, exactly one replacement scan is queued.
+  property int folderGeneration: 0
+  property int scanGen: -1
+  property bool pendingScan: false
+  property string scanError: ""
+  readonly property bool scanning: scanProcess.running
+  readonly property bool watchError: root.watcherFailures >= 20
+
+  function restartTimer() {
+    root.advanceDueAt = Date.now() + root.intervalSec * 1000
+  }
 
   function loadCurrent() {
     if (root.index < 0 || root.index >= root.files.length) return
     root.pendingAdvance = false
+    gifWatchdog.stop()
+    root.gifLastFrame = -1
+    root.gifWrapped = false
+    root.gifLastFrameChange = Date.now()
     var url = root.files[root.index]
+    root.currentPath = url
     root.currentBase = url.substring(url.lastIndexOf("/") + 1)
-    root.failCount = 0
     if (MediaModel.isVideo(url)) {
       photo.visible = false
+      photo.source = ""
       gifItem.visible = false
+      gifItem.source = ""
+      gifItem.playing = false
       videoItem.visible = true
-      videoPlayer.source = url
-      videoPlayer.play()
+      videoPlayer.source = MediaModel.toFileUrl(url)
+      if (root.playbackActive) videoPlayer.play()
     } else if (MediaModel.isGif(url)) {
-      videoPlayer.stop()
-      videoPlayer.source = ""
       photo.visible = false
+      photo.source = ""
       videoItem.visible = false
-      gifItem.visible = true
-      gifItem.source = url
-      gifItem.playing = true
-      kenBurns.running = false
-    } else {
       videoPlayer.stop()
       videoPlayer.source = ""
+      gifItem.source = MediaModel.toFileUrl(url)
+      gifItem.visible = true
+      gifItem.playing = root.playbackActive
+      if (kenBurns.running) kenBurns.restart()
+    } else {
+      gifItem.source = ""
+      gifItem.playing = false
       gifItem.visible = false
       videoItem.visible = false
+      videoPlayer.stop()
+      videoPlayer.source = ""
+      photo.source = MediaModel.toFileUrl(url)
       photo.visible = true
-      photo.source = url
-      photo.scale = 1.0
-      kenBurns.restart()
+      if (kenBurns.running) kenBurns.restart()
     }
     root.restartTimer()
   }
 
   function next() {
     if (root.files.length === 0) return
-    root.index = MediaModel.nextIndex(root.index, root.files.length, root.shuffle)
+    if (root.shuffle) root.history = MediaModel.pushHistory(root.history, root.index)
+    var idx = MediaModel.nextIndex(root.index, root.files, root.shuffle, root.failedPaths)
+    if (idx < 0) return
+    root.index = idx
     root.loadCurrent()
   }
 
   function prev() {
     if (root.files.length === 0) return
-    root.index = (root.index - 1 + root.files.length) % root.files.length
+    if (root.shuffle && root.history.length > 0) {
+      var r = MediaModel.popHistory(root.history)
+      root.history = r.history
+      root.index = r.index
+    } else {
+      root.index = (root.index - 1 + root.files.length) % root.files.length
+    }
     root.loadCurrent()
   }
 
   function togglePause() {
     root.paused = !root.paused
-    if (!root.paused && root.files.length > 0 && videoItem.visible) videoPlayer.play()
-    slideTimer.running = root.files.length > 0 && !root.paused
   }
 
   function onTimerExpired() {
-    if (root.files.length === 0) return
-    if (videoItem.visible) {
-      root.pendingAdvance = true
-    } else if (gifItem.visible && gifItem.frameCount > 0) {
-      root.pendingAdvance = true
-    } else {
+    var d = MediaModel.timerDecision(
+      root.files.length > 0, root.allFailed, root.autoplay,
+      videoItem.visible, gifItem.visible, gifItem.frameCount)
+    if (d.advanceNow) {
       root.next()
+    } else if (d.awaitBoundary) {
+      // Videos advance at EndOfMedia; GIFs on the next loop boundary (the
+      // watchdog breaks a stall from one-frame or finite GIFs).
+      root.pendingAdvance = true
     }
   }
 
-  function applyMedia(list) {
+  // Mark the current item as unplayable and move on. With every remaining
+  // item marked, playback stops and the "no playable media" state shows
+  // instead of looping forever.
+  function handleMediaFailure() {
+    var path = root.currentPath
+    if (path !== "") root.failedPaths[path] = true
+    if (!root.playbackActive || root.files.length === 0) return
+    root.pendingAdvance = false
+    gifWatchdog.stop()
+    var nextIdx = MediaModel.nextIndex(root.index, root.files, root.shuffle, root.failedPaths)
+    if (nextIdx < 0) {
+      root.index = -1
+      root.stopPlayback()
+      return
+    }
+    root.history = []
+    root.index = nextIdx
+    root.loadCurrent()
+  }
+
+  function stopPlayback() {
+    root.pendingAdvance = false
+    gifWatchdog.stop()
+    videoPlayer.stop()
+    videoPlayer.source = ""
+    videoItem.visible = false
+    gifItem.visible = false
+    gifItem.playing = false
+    gifItem.source = ""
+    photo.visible = false
+    photo.source = ""
+    photo.scale = 1.0
+  }
+
+  // Forget every failure mark and try again. Used by the context-menu retry
+  // row and after a scan replaces the folder contents.
+  function retryMedia() {
+    root.failedPaths = {}
+    if (root.files.length === 0) {
+      root.runScan()
+      return
+    }
+    var idx = MediaModel.nextIndex(-1, root.files, root.shuffle, {})
+    if (idx < 0) idx = 0
+    root.index = idx
+    root.loadCurrent()
+  }
+
+  // Fresh scan output arrives here. The current item is always reloaded so
+  // an overwritten file shows its new contents right away.
+  function applyMedia(result) {
+    var list = result.files || []
     var merged = MediaModel.mergeMedia(list, root.files, root.index)
-    if (merged.files === root.files && merged.index === root.index) return
+    // Keep failure marks only for files that still exist; a rescanned file
+    // gets a clean slate (it may have been fixed or replaced).
+    var failed = {}
+    for (var k in root.failedPaths) if (list.indexOf(k) >= 0) failed[k] = true
+    root.failedPaths = failed
     root.files = merged.files
-    if (merged.index >= 0 && merged.index < merged.files.length) {
-      root.index = merged.index
-      root.restartTimer()
-    } else if (merged.files.length > 0) {
-      root.index = Math.floor(Math.random() * merged.files.length)
-      root.loadCurrent()
-    } else {
+    if (merged.files.length === 0) {
       root.index = -1
       root.currentBase = ""
-      photo.visible = false
-      gifItem.visible = false
-      gifItem.playing = false
-      videoItem.visible = false
-      videoPlayer.stop()
-      videoPlayer.source = ""
-      kenBurns.running = false
-      slideTimer.stop()
+      root.currentPath = ""
+      root.stopPlayback()
+      return
     }
+    if (merged.index >= 0) {
+      root.index = merged.index
+    } else {
+      var idx = MediaModel.nextIndex(-1, merged.files, root.shuffle, root.failedPaths)
+      if (idx < 0) {
+        root.index = -1
+        root.stopPlayback()
+        return
+      }
+      root.index = idx
+    }
+    root.loadCurrent()
+    root.restartTimer()
   }
 
   // ---- folder management -------------------------------------------------
-  function ensureFolder() {
-    if (root.folder === "") return
-    mkdirProcess.command = ["bash", "-c", 'mkdir -p "$0"', root.folder]
-    mkdirProcess.running = true
-  }
-
+  // scan.sh creates the folder itself before scanning, so there is no race
+  // between folder creation and the first scan/watch.
   function runScan() {
-    if (root.folder === "" || scanProcess.running) return
+    if (root.folder === "") return
+    if (scanProcess.running) {
+      root.pendingScan = true
+      return
+    }
+    root.scanError = ""
+    root.scanGen = root.folderGeneration
     scanProcess.command = ["bash", root.pluginDir + "/scan.sh", root.folder]
     scanProcess.running = true
   }
 
+  property int watcherFailures: 0
+  property bool stoppingWatcher: false
+
   function restartWatcher() {
+    root.stoppingWatcher = true
     watchProcess.running = false
     Qt.callLater(function() {
+      root.stoppingWatcher = false
       if (root.folder === "") return
       watchProcess.command = [
         "inotifywait", "-m", "-r",
@@ -273,6 +408,7 @@ Item {
         root.folder
       ]
       watchProcess.running = true
+      watcherHealthTimer.restart()
     })
   }
 
@@ -284,7 +420,7 @@ Item {
       return
     }
     root.folder = path
-    root.ensureFolder()
+    root.folderGeneration += 1
     root.runScan()
     root.restartWatcher()
     root.persistEntry()
@@ -301,50 +437,103 @@ Item {
     Util.execDetached(["xdg-open", root.folder])
   }
 
+  // The window may not have a screen assigned yet while the shell is still
+  // starting; fall back to the first Quickshell screen in that case.
+  function screenForWindow() {
+    var s = window.screen
+    if (!s) {
+      var screens = Quickshell.screens || []
+      s = screens.length > 0 ? screens[0] : null
+    }
+    return s
+  }
+
+  function screenWidth() {
+    var s = root.screenForWindow()
+    return s ? s.width : 1920
+  }
+
+  function screenHeight() {
+    var s = root.screenForWindow()
+    return s ? s.height : 1080
+  }
+
+  // Clamp a right/bottom margin so the card stays fully on its screen.
+  function clampRight(v) { return MediaModel.clampMargin(v, root.size, root.screenWidth()) }
+  function clampBottom(v) { return MediaModel.clampMargin(v, root.size, root.screenHeight()) }
+
+  function resetPosition() {
+    root.marginRight = root.clampRight(root.defaultMarginRight)
+    root.marginBottom = root.clampBottom(root.defaultMarginBottom)
+    root.persistEntry()
+  }
+
+  // ---- derived UI state -----------------------------------------------------
+  readonly property bool allFailed: MediaModel.allFailed(root.files, root.failedPaths)
+  readonly property bool loadingMedia: (photo.visible && photo.status === Image.Loading)
+    || (gifItem.visible && gifItem.status === Image.Loading)
+    || (videoItem.visible && videoPlayer.mediaStatus === MediaPlayer.LoadingMedia)
+  readonly property var status: MediaModel.statusFor(
+    root.flash, root.flashError, root.flashActive,
+    root.scanError, root.watchError, root.allFailed)
+  readonly property string statusText: root.status.text
+  readonly property bool statusError: root.status.error
+
+  function showFlash(msg, isError) {
+    root.flash = msg
+    root.flashError = isError === true
+    root.flashActive = true
+    flashTimer.restart()
+  }
+
   // ---- window -------------------------------------------------------------
+  // Card-sized layer surface: no full-screen buffer, no input mask needed.
   PanelWindow {
     id: window
-    visible: root.opened && !root.locked
-    anchors { top: true; bottom: true; left: true; right: true }
+    visible: root.opened && !root.locked && root.lockStateKnown
+    anchors { right: true; bottom: true }
+    margins { right: root.marginRight; bottom: root.marginBottom }
+    width: root.size
+    height: root.size
     color: "transparent"
     WlrLayershell.namespace: "omarchy-mediawidget"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
     exclusionMode: ExclusionMode.Ignore
-    // Only the card is interactive; everything else is click-through.
-    mask: Region {
-      x: card.x
-      y: card.y
-      width: card.width
-      height: card.height
-    }
 
-    Shortcut { sequence: "Space"; enabled: root.opened; onActivated: root.togglePause() }
-    Shortcut { sequence: "Right"; enabled: root.opened; onActivated: root.next() }
-    Shortcut { sequence: "Left"; enabled: root.opened; onActivated: root.prev() }
-    Shortcut { sequence: "Esc"; enabled: root.opened; onActivated: root.requestClose() }
+    // Keyboard shortcuts only work after the card (or a control inside it)
+    // has deliberate focus; the context menu owns its keys while open.
+    Shortcut { sequence: "Space"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.togglePause() }
+    Shortcut { sequence: "Right"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.next() }
+    Shortcut { sequence: "Left"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.prev() }
+    Shortcut { sequence: "Esc"; enabled: root.opened && card.activeFocus; onActivated: { if (contextMenu.visible) contextMenu.visible = false; else root.requestClose() } }
 
-    // The widget square. Anchored to the bottom-right of the screen; dragging
-    // it updates the margins.
     Rectangle {
       id: card
-      width: root.size
-      height: root.size
+      anchors.fill: parent
       color: "transparent"
-      anchors.right: parent.right
-      anchors.bottom: parent.bottom
-      anchors.rightMargin: root.marginRight
-      anchors.bottomMargin: root.marginBottom
       clip: true
       focus: true
 
+      // Visible focus state for keyboard users.
+      Rectangle {
+        id: focusRing
+        anchors.fill: parent
+        radius: Math.min(root.radius, root.size / 2)
+        border.width: 2
+        border.color: Style.focusBorderColor
+        color: "transparent"
+        visible: card.activeFocus
+        z: 5
+      }
+
       // ---- media layers -------------------------------------------------
-      // Masked to the user's corner radius via a layer effect
-      // (Rectangle.clip only ever clips to a square).
+      // The masking layer only engages when rounded corners are actually
+      // configured; a square card renders with no layer at all.
       Item {
         id: cardContent
         anchors.fill: parent
-        layer.enabled: true
+        layer.enabled: root.radius > 0
         layer.smooth: true
         layer.effect: MultiEffect {
           maskEnabled: true
@@ -357,10 +546,16 @@ Item {
           id: photo
           anchors.fill: parent
           fillMode: Image.PreserveAspectCrop
+          asynchronous: true
+          cache: false
           smooth: true
           visible: false
+          // Decode at card size × display scale; never at full resolution.
+          sourceSize.width: root.mediaPixelSize
+          sourceSize.height: root.mediaPixelSize
           onStatusChanged: {
-            if (status === Image.Error && visible && root.failCount++ < root.files.length) root.next()
+            if (status === Image.Ready && visible) delete root.failedPaths[root.currentPath]
+            else if (status === Image.Error && visible) root.handleMediaFailure()
           }
         }
 
@@ -368,16 +563,25 @@ Item {
           id: gifItem
           anchors.fill: parent
           fillMode: Image.PreserveAspectCrop
+          asynchronous: true
+          // No frame caching: a long GIF must not pin every frame in RAM.
+          cache: false
           visible: false
-          paused: root.paused || root.locked
+          paused: !root.playbackActive
+          sourceSize.width: root.mediaPixelSize
+          sourceSize.height: root.mediaPixelSize
           onCurrentFrameChanged: {
-            if (root.pendingAdvance && currentFrame === 0 && visible) {
+            root.gifLastFrameChange = Date.now()
+            if (currentFrame === 0 && root.gifLastFrame > 0) root.gifWrapped = true
+            root.gifLastFrame = currentFrame
+            if (root.pendingAdvance && currentFrame === 0 && root.gifWrapped && visible) {
               root.pendingAdvance = false
               root.next()
             }
           }
           onStatusChanged: {
-            if (status === Image.Error && visible && root.failCount++ < root.files.length) root.next()
+            if (status === Image.Ready && visible) delete root.failedPaths[root.currentPath]
+            else if (status === Image.Error && visible) root.handleMediaFailure()
           }
         }
 
@@ -391,20 +595,19 @@ Item {
             videoOutput: videoOutput
             audioOutput: audioOut
             onMediaStatusChanged: {
-              if (mediaStatus === MediaPlayer.EndOfMedia && !root.paused) {
+              if (mediaStatus === MediaPlayer.EndOfMedia && root.playbackActive) {
                 if (root.pendingAdvance) {
                   root.pendingAdvance = false
                   root.next()
                 } else {
                   videoPlayer.play()
                 }
+              } else if (mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia) {
+                delete root.failedPaths[root.currentPath]
               }
             }
             onErrorOccurred: {
-              if (!root.paused && root.failCount++ < root.files.length) root.next()
-            }
-            onPlayingChanged: function(playing) {
-              if (playing) root.failCount = 0
+              if (root.playbackActive) root.handleMediaFailure()
             }
           }
 
@@ -416,13 +619,20 @@ Item {
           }
         }
 
+        // Ken Burns zoom, bound to the same playbackActive lifecycle.
+        // Imperative `running =` writes are never used, so the binding
+        // cannot be severed.
         SequentialAnimation {
           id: kenBurns
-          running: root.effects && photo.visible && !root.paused && !root.locked
+          running: root.effects && root.playbackActive && photo.visible
           loops: Animation.Infinite
           NumberAnimation { target: photo; property: "scale"; from: 1.0; to: 1.08; duration: 45000; easing.type: Easing.InOutSine }
           NumberAnimation { target: photo; property: "scale"; from: 1.08; to: 1.0; duration: 45000; easing.type: Easing.InOutSine }
         }
+
+        // Keep the zoom pinned to 1.0 when the effect is switched off (see
+        // the root-level onEffectsChanged handler: signals cannot cross
+        // objects, so the reset lives where the `effects` property lives).
       }
 
       // Mask shape for cardContent's layer effect; invisible, radius 0..size/2.
@@ -434,40 +644,62 @@ Item {
         layer.enabled: true
       }
 
-      // ---- empty state --------------------------------------------------
+      // ---- loading indicator ---------------------------------------------
+      Rectangle {
+        id: loadingPill
+        visible: root.loadingMedia && !root.allFailed
+        anchors.centerIn: parent
+        height: 26
+        width: Math.min(loadingLabel.implicitWidth + 24, parent.width - 24)
+        radius: 13
+        color: "#B0101010"
+        Text {
+          id: loadingLabel
+          anchors.centerIn: parent
+          text: "Loading…"
+          color: "#E6FFFFFF"
+          font.pixelSize: 11
+        }
+      }
+
+      // ---- empty state ---------------------------------------------------
       Column {
         id: emptyHint
-        visible: root.files.length === 0 && !root.picking
+        visible: root.files.length === 0
         anchors.centerIn: parent
-        spacing: 6
+        spacing: 10
+
         Text {
+          anchors.horizontalCenter: parent.horizontalCenter
           text: "No media found"
-          color: "#E6FFFFFF"
-          font.pixelSize: 13
-          font.bold: true
-          anchors.horizontalCenter: parent.horizontalCenter
+          color: "#99FFFFFF"
+          font.pixelSize: 12
         }
+
+        // Status line above the pick button while picking/scanning/failing.
         Text {
-          text: root.folder
+          anchors.horizontalCenter: parent.horizontalCenter
+          text: root.statusText
+          color: root.statusError ? "#FFB9B9" : "#99FFFFFF"
+          font.pixelSize: 10
+          visible: root.statusText !== ""
+        }
+
+        // Hint shown only while idle: nothing pending and nothing failed.
+        Text {
+          anchors.horizontalCenter: parent.horizontalCenter
+          text: root.picking ? "Picking folder…" : "Pick a folder"
           color: "#99FFFFFF"
           font.pixelSize: 10
-          elide: Text.ElideMiddle
-          width: Math.min(implicitWidth, root.size - 40)
-          horizontalAlignment: Text.AlignHCenter
+          visible: !root.picking && !root.scanning && root.statusText === ""
         }
-        Text {
-          text: "Drop images, GIFs or videos in and they appear here."
-          color: "#99FFFFFF"
-          font.pixelSize: 10
-          anchors.horizontalCenter: parent.horizontalCenter
-        }
+
         Rectangle {
           anchors.horizontalCenter: parent.horizontalCenter
           width: pickHintButton.implicitWidth + 24
           height: 30
           radius: 15
           color: root.picking ? "#33FFFFFF" : "#26FFFFFF"
-          anchors.topMargin: 10
           Text {
             id: pickHintButton
             anchors.centerIn: parent
@@ -482,6 +714,28 @@ Item {
             onEntered: parent.color = "#3DFFFFFF"
             onExited: parent.color = root.picking ? "#33FFFFFF" : "#26FFFFFF"
           }
+        }
+      }
+
+      // ---- floating status pill (over live media) ------------------------
+      Rectangle {
+        id: statusPill
+        anchors.top: parent.top
+        anchors.topMargin: 10
+        anchors.horizontalCenter: parent.horizontalCenter
+        visible: root.statusText !== "" && root.files.length > 0
+        height: 24
+        width: Math.min(statusLabel.implicitWidth + 20, parent.width - 24)
+        radius: 12
+        color: root.statusError ? "#CC402020" : "#B0101010"
+        Text {
+          id: statusLabel
+          anchors.centerIn: parent
+          text: root.statusText
+          color: "#F0FFFFFF"
+          font.pixelSize: 11
+          elide: Text.ElideMiddle
+          width: Math.min(implicitWidth, statusPill.width - 20)
         }
       }
 
@@ -534,44 +788,59 @@ Item {
       }
 
       // ---- input ----------------------------------------------------------
-      MouseArea {
+      // Non-blocking hover: the card never steals the pointer from windows
+      // that happen to pass under it.
+      HoverHandler {
         id: cardHover
+        acceptedDevices: PointerDevice.Mouse
+      }
+
+      MouseArea {
+        id: contextArea
         anchors.fill: parent
-        hoverEnabled: true
         acceptedButtons: Qt.RightButton
         onPressed: function(mouse) {
           if (mouse.button === Qt.RightButton) contextMenu.visible = true
         }
       }
 
-      MouseArea {
-        id: dragArea
-        anchors.fill: parent
+      // Plain left click gives the card keyboard focus. A TapHandler grabs
+      // passively, so it neither blocks the IconButtons nor the DragHandler,
+      // and it stays quiet once a click turns into a drag.
+      TapHandler {
         acceptedButtons: Qt.LeftButton
-        property int startX: 0
-        property int startY: 0
-        property int startRight: 0
-        property int startBottom: 0
-        property bool dragged: false
-        onPressed: function(mouse) {
-          card.forceActiveFocus()
-          contextMenu.visible = false
-          var g = dragArea.mapToGlobal(mouse.x, mouse.y)
-          startX = g.x
-          startY = g.y
-          startRight = root.marginRight
-          startBottom = root.marginBottom
-          dragged = false
+        acceptedDevices: PointerDevice.Mouse
+        onTapped: card.forceActiveFocus()
+      }
+
+      // Drag the card with the left button; the card surface moves on the
+      // layer shell by adjusting the margins. Qt 6.11 exposes neither
+      // pressed/pressedChanged nor point/pointChanged on DragHandler, so
+      // everything hangs off active instead: margins are captured when the
+      // drag engages and persisted when it ends.
+      DragHandler {
+        id: cardDrag
+        target: window
+        acceptedButtons: Qt.LeftButton
+        property real startRight: 0
+        property real startBottom: 0
+        onActiveChanged: {
+          if (active) {
+            contextMenu.visible = false
+            cardDrag.startRight = root.marginRight
+            cardDrag.startBottom = root.marginBottom
+          } else {
+            // Snap the final position back on screen and save it.
+            root.marginRight = root.clampRight(root.marginRight)
+            root.marginBottom = root.clampBottom(root.marginBottom)
+            root.persistEntry()
+          }
         }
-        onPositionChanged: function(mouse) {
-          if (!pressed) return
-          var g = dragArea.mapToGlobal(mouse.x, mouse.y)
-          if (g.x !== startX || g.y !== startY) dragged = true
-          root.marginRight = Math.max(0, startRight - (g.x - startX))
-          root.marginBottom = Math.max(0, startBottom - (g.y - startY))
+        onTranslationChanged: function(t) {
+          if (!cardDrag.active) return
+          root.marginRight = root.clampRight(cardDrag.startRight - t.x)
+          root.marginBottom = root.clampBottom(cardDrag.startBottom - t.y)
         }
-        // Only a real drag (not a plain click) rewrites the saved position.
-        onReleased: if (dragged) root.persistEntry()
       }
 
       // ---- context menu ---------------------------------------------------
@@ -655,6 +924,11 @@ Item {
               onCommitted: root.persistEntry()
             }
             MenuRow {
+              text: "Retry media"
+              rowHeight: 30
+              onTriggered: { contextMenu.visible = false; root.retryMedia() }
+            }
+            MenuRow {
               text: root.picking ? "Picking folder…" : "Pick folder…"
               rowHeight: 30
               onTriggered: root.pickFolder()
@@ -723,7 +997,18 @@ Item {
       id: scanStdout
       waitForEnd: true
     }
-    onExited: root.applyMedia(MediaModel.parseScan(scanStdout.text))
+    onExited: {
+      if (root.scanGen !== root.folderGeneration) return
+      if (exitCode !== 0) {
+        root.scanError = "Folder scan failed (exit " + exitCode + ")"
+        return
+      }
+      root.applyMedia(MediaModel.parseScan(scanStdout.text))
+      if (root.pendingScan) {
+        root.pendingScan = false
+        root.runScan()
+      }
+    }
   }
 
   Process {
@@ -731,6 +1016,33 @@ Item {
     stdout: SplitParser {
       onRead: function(chunk) { debounceTimer.restart() }
     }
+    onExited: function(exitCode) {
+      if (root.stoppingWatcher || exitCode === 0) return
+      root.watcherFailures += 1
+      if (root.watcherFailures <= 20) {
+        watcherRetryTimer.interval = Math.min(60000, 1000 * Math.pow(2, Math.min(root.watcherFailures - 1, 5)))
+        watcherRetryTimer.restart()
+      }
+    }
+  }
+
+  // A watcher that stays up for 10 s after a restart is healthy.
+  Timer {
+    id: watcherHealthTimer
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (watchProcess.running) {
+        root.watcherFailures = 0
+      }
+    }
+  }
+
+  Timer {
+    id: watcherRetryTimer
+    interval: 1000
+    repeat: false
+    onTriggered: root.restartWatcher()
   }
 
   Timer {
@@ -740,44 +1052,83 @@ Item {
   }
 
   Process {
-    id: mkdirProcess
-    command: ["bash", "-c", "true"]
-  }
-
-  Process {
     id: pickProcess
     stdout: StdioCollector {
       id: pickStdout
       waitForEnd: true
     }
-    onExited: {
+    onExited: function(exitCode) {
       root.picking = false
-      if (exitCode !== 0) return
-      root.setFolder(pickStdout.text)
+      if (exitCode === 1) { root.showFlash("Folder picker cancelled", false); return }
+      if (exitCode === 2) { root.showFlash("Install zenity or kdialog to pick a folder", true); return }
+      if (exitCode !== 0) { root.showFlash("Folder picker failed (exit " + exitCode + ")", true); return }
+      var path = String(pickStdout.text || "").replace(/^\s+|\s+$/g, "")
+      if (path === "") return
+      root.setFolder(path)
+    }
+  }
+
+  // ---- slideshow clock -----------------------------------------------------
+  // A plain 250 ms poll against a deadline timestamp: restarting the countdown
+  // never has to touch slideTimer.running, so the `files`/`playbackActive`
+  // binding stays intact.
+  Timer {
+    id: slideTimer
+    interval: 250
+    repeat: true
+    running: root.files.length > 0 && root.playbackActive
+    onTriggered: {
+      if (Date.now() >= root.advanceDueAt) root.onTimerExpired()
+    }
+  }
+
+  // Breaks a stalled GIF: if a pending advance never sees a loop boundary
+  // (one-frame or finite GIFs that stop producing frames), move on anyway.
+  Timer {
+    id: gifWatchdog
+    interval: 500
+    repeat: true
+    running: root.pendingAdvance && gifItem.visible
+    onTriggered: {
+      var stalled = Date.now() - root.gifLastFrameChange > 4000
+      if (gifItem.frameCount === 1 || stalled) {
+        root.pendingAdvance = false
+        root.next()
+      }
     }
   }
 
   Timer {
-    id: slideTimer
-    interval: root.intervalSec * 1000
-    repeat: true
-    running: root.files.length > 0 && !root.paused && !root.locked
-    onTriggered: root.onTimerExpired()
+    id: flashTimer
+    interval: 4000
+    onTriggered: root.flashActive = false
   }
 
-  // Retry connecting to the lock service until it is loaded.
+  // ---- lock state ----------------------------------------------------------
+  // Polls the lock service so a reloaded service instance is reconnected;
+  // while the service is gone the widget stays conservatively hidden.
   Timer {
     id: lockServiceRetry
-    interval: 200
+    interval: 2000
     repeat: true
-    running: root.started && !root.lockService && root.lockServiceAttempts <= 30
-    onTriggered: root.connectLockService()
+    running: root.started
+    onTriggered: {
+      if (!root.shell || typeof root.shell.serviceFor !== "function") return
+      var svc = root.shell.serviceFor("omarchy.lock")
+      if (svc && svc !== root.lockService) {
+        root.connectLockService()
+      } else if (!svc && root.lockService) {
+        root.lockService = null
+        lockServiceConn.target = null
+        root.lockStateKnown = false
+      }
+    }
   }
 
   Connections {
     id: lockServiceConn
     function onLockedChanged() {
-      root.setLocked(root.lockService.locked)
+      root.serviceLocked = root.lockService.locked === true
     }
   }
 
@@ -786,9 +1137,30 @@ Item {
   Connections {
     target: Hyprland
     function onRawEvent(event) {
-      if (event.name === "lockactive") root.setLocked(event.data === "1")
+      if (event.name === "lockactive") {
+        root.hyprLocked = event.data === "1"
+        root.lockStateKnown = true
+      }
     }
   }
+
+  // Initial Hyprland lock state: the shell's own helper answers 0/1/2
+  // (locked / unlocked / undetermined).
+  Process {
+    id: hyprLockProbe
+    command: ["bash", "-c", "omarchy-hyprland-session-locked"]
+    onExited: function(exitCode) {
+      if (exitCode === 0 || exitCode === 1) {
+        root.hyprLocked = exitCode === 0
+        root.lockStateKnown = true
+      }
+    }
+  }
+
+  readonly property int mediaPixelSize: Math.max(
+    64,
+    Math.round(root.size * (window.devicePixelRatio > 0 ? window.devicePixelRatio : 1))
+  )
 
   Component.onCompleted: {
     root.open()

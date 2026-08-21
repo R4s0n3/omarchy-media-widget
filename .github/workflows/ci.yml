@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt 6 test tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev-tools qml6-module-qttest
+
+      # qmllint (-I) and `omarchy plugin validate` need the Omarchy shell's
+      # qs.Commons/qs.Ui modules and Quickshell qmltypes, which are not
+      # published as a plain Qt package; they are run locally / on Omarchy
+      # machines via tests/lint.sh and omarchy plugin validate. The suites
+      # below exercise all pure logic (MediaModel.js, scan.sh,
+      # sync_icloud.sh with a fake docker) and run everywhere.
+      - name: bash -n syntax check
+        run: bash -n scan.sh pick-folder.sh scripts/sync_icloud.sh tests/test_scan.sh tests/test_icloud.sh tests/run_tests.sh tests/lint.sh
+
+      - name: QML model tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: qmltestrunner -input tests/tst_media.qml -o -,txt
+
+      - name: shell test suites
+        run: |
+          ./tests/test_scan.sh
+          ./tests/test_icloud.sh
