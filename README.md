@@ -12,7 +12,9 @@ rewrite. It is pure QML + shell scripts and needs no separate runtime.
 ## Features
 
 - Plays photos, GIFs and videos (mp4, mov, m4v, webm, mkv, avi, jpg, png,
-  gif, webp, bmp, avif) from any folder, recursively.
+  gif, webp, bmp, avif, psd, psb) from any folder, recursively. Photoshop
+  and other extra formats need the `kimageformats` package (`omarchy pkg add
+  kimageformats`); unsupported files are skipped automatically.
 - The folder is picked from the context menu with the normal folder picker
   (zenity, kdialog fallback).
 - Draggable: grab the square with the left button and move it anywhere;

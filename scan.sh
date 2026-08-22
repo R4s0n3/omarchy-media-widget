@@ -14,7 +14,7 @@
 set -euo pipefail
 
 folder="$1"
-exts=('*.jpg' '*.jpeg' '*.png' '*.gif' '*.webp' '*.bmp' '*.avif' '*.mp4' '*.mov' '*.m4v' '*.webm' '*.mkv' '*.avi')
+  exts=('*.jpg' '*.jpeg' '*.png' '*.gif' '*.webp' '*.bmp' '*.avif' '*.psd' '*.psb' '*.mp4' '*.mov' '*.m4v' '*.webm' '*.mkv' '*.avi')
 
 if [[ ! -d "$folder" ]]; then
   mkdir -p "$folder" 2>/dev/null || exit 0
