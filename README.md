@@ -46,7 +46,7 @@ enabled (the plugin manager asks for confirmation and where to place the bar
 button):
 
 ```
-omarchy plugin add https://github.com/ras/widget-omarchy.git --enable
+omarchy plugin add https://github.com/R4s0n3/omarchy-media-widget.git --enable
 ```
 
 - `--enable` also places the bar button; without it, run

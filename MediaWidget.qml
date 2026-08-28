@@ -149,7 +149,7 @@ Item {
     // still constrains interactive changes to 300..3600s.
     root.intervalSec = Math.min(86400, Math.max(5, Number(e.interval) || 300))
     root.size = Math.min(1200, Math.max(160, Number(e.size) || 360))
-    root.radius = Math.min(Number(e.radius) || 0, root.size / 2)
+    root.radius = Math.max(0, Math.min(Number(e.radius) || 0, root.size / 2))
     root.shuffle = e.shuffle === true
     root.effects = e.effects !== false
     root.autoplay = e.autoplay !== false
@@ -802,8 +802,8 @@ Item {
           if (!pressed) return
           var g = dragArea.mapToGlobal(mouse.x, mouse.y)
           if (g.x !== startX || g.y !== startY) dragged = true
-          root.marginRight = Math.max(0, startRight - (g.x - startX))
-          root.marginBottom = Math.max(0, startBottom - (g.y - startY))
+          root.marginRight = root.clampRight(startRight - (g.x - startX))
+          root.marginBottom = root.clampBottom(startBottom - (g.y - startY))
         }
         // Only a real drag (not a plain click) rewrites the saved position.
         onReleased: if (dragged) root.persistEntry()
@@ -1009,6 +1009,8 @@ Item {
                 onTriggered: {
                   root.size = modelData
                   root.radius = Math.min(root.radius, root.size / 2)
+                  root.marginRight = root.clampRight(root.marginRight)
+                  root.marginBottom = root.clampBottom(root.marginBottom)
                   root.persistEntry()
                   sizePage.visible = false
                   mainPage.visible = true

@@ -9,12 +9,15 @@ run() {
   shift
   echo "== $desc"
   "$@"
+  local status=$?
   echo
+  return "$status"
 }
 
 failed=0
 
-run "QML model tests" bash -c 'QT_QPA_PLATFORM=offscreen /usr/lib/qt6/bin/qmltestrunner -input '"$DIR"'/tst_media.qml -o -,txt' || failed=1
+run "QML model tests" env QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME= \
+  /usr/lib/qt6/bin/qmltestrunner -input "$DIR/tst_media.qml" -o -,txt || failed=1
 run "scan.sh tests" "$DIR/test_scan.sh" || failed=1
 run "sync_icloud.sh tests" "$DIR/test_icloud.sh" || failed=1
 
