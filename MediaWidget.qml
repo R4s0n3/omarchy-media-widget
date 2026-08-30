@@ -225,6 +225,7 @@ Item {
     // be matched against the file that is actually on display.
     photo.loadedPath = ""
     gifItem.loadedPath = ""
+    videoItem.loadedPath = ""
     root.currentPath = url
     root.currentBase = url.substring(url.lastIndexOf("/") + 1)
     if (MediaModel.isVideo(url)) {
@@ -234,6 +235,7 @@ Item {
       gifItem.visible = false
       gifItem.source = ""
       gifItem.playing = false
+      videoItem.loadedPath = url
       videoPlayer.source = MediaModel.toFileUrl(url)
       if (root.playbackActive) videoPlayer.play()
     } else if (MediaModel.isGif(url)) {
@@ -243,8 +245,11 @@ Item {
       videoItem.visible = false
       videoPlayer.stop()
       videoPlayer.source = ""
-      gifItem.source = MediaModel.toFileUrl(url)
+      // Tag the request before assigning source. Image status can change
+      // synchronously (notably for an unsupported/corrupt first file); if
+      // the tag comes second that error is lost and startup stays blank.
       gifItem.loadedPath = url
+      gifItem.source = MediaModel.toFileUrl(url)
       gifItem.playing = root.playbackActive
       if (kenBurns.running) kenBurns.restart()
     } else {
@@ -255,8 +260,8 @@ Item {
       videoItem.visible = false
       videoPlayer.stop()
       videoPlayer.source = ""
-      photo.source = MediaModel.toFileUrl(url)
       photo.loadedPath = url
+      photo.source = MediaModel.toFileUrl(url)
       if (kenBurns.running) kenBurns.restart()
     }
     root.restartTimer()
@@ -305,9 +310,26 @@ Item {
   // advanced can never blame the wrong file. Marks are not permanent:
   // rescans clear them and a full-failure state auto-recovers (see
   // allFailedTimer), so one bad iCloud sync moment cannot kill the widget.
+  function clearMediaFailure(path) {
+    if (!root.failedPaths[path]) return
+    var updated = {}
+    for (var key in root.failedPaths) {
+      if (key !== path) updated[key] = true
+    }
+    root.failedPaths = updated
+  }
+
   function handleMediaFailure(path) {
     if (path === undefined || path === null || path === "") return
-    root.failedPaths[path] = true
+    // Reassign the map instead of mutating it in place so `allFailed` and
+    // its empty/retry UI are notified immediately.
+    var updated = {}
+    for (var key in root.failedPaths) updated[key] = true
+    updated[path] = true
+    root.failedPaths = updated
+    // A late callback from the item we just replaced must not skip the new,
+    // healthy current item.
+    if (path !== root.currentPath) return
     if (!root.playbackActive || root.files.length === 0) return
     root.pendingAdvance = false
     gifWatchdog.stop()
@@ -336,6 +358,7 @@ Item {
     photo.source = ""
     photo.loadedPath = ""
     gifItem.loadedPath = ""
+    videoItem.loadedPath = ""
     photo.scale = 1.0
   }
 
@@ -496,26 +519,22 @@ Item {
   }
 
   // ---- window -------------------------------------------------------------
-  // Full-screen click-through surface with the card placed by inner margins,
-  // exactly like before the review: the surface never moves while dragging,
-  // so mapToGlobal deltas stay stable and the card keeps its grip on the
-  // cursor. Only the card area accepts input via the mask.
+  // Keep the layer surface the size of the card. A full-screen transparent
+  // overlay still costs a full-screen surface and, on some compositors, its
+  // input region can stall interaction/rendering in normal application
+  // windows even when a smaller mask is requested.
   PanelWindow {
     id: window
     visible: root.opened && !root.locked
-    anchors { top: true; bottom: true; left: true; right: true }
+    anchors { right: true; bottom: true }
+    margins { right: root.marginRight; bottom: root.marginBottom }
+    width: root.size
+    height: root.size
     color: "transparent"
     WlrLayershell.namespace: "omarchy-mediawidget"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
     exclusionMode: ExclusionMode.Ignore
-    // Only the card is interactive; everything else is click-through.
-    mask: Region {
-      x: card.x
-      y: card.y
-      width: card.width
-      height: card.height
-    }
 
     // Keyboard shortcuts only work after the card (or a control inside it)
     // has deliberate focus; the context menu owns its keys while open.
@@ -524,17 +543,10 @@ Item {
     Shortcut { sequence: "Left"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.prev() }
     Shortcut { sequence: "Esc"; enabled: root.opened && card.activeFocus; onActivated: { if (contextMenu.visible) contextMenu.visible = false; else root.requestClose() } }
 
-    // The widget square. Anchored to the bottom-right of the screen; dragging
-    // it updates the margins.
     Rectangle {
       id: card
-      width: root.size
-      height: root.size
+      anchors.fill: parent
       color: "transparent"
-      anchors.right: parent.right
-      anchors.bottom: parent.bottom
-      anchors.rightMargin: root.marginRight
-      anchors.bottomMargin: root.marginBottom
       clip: true
       focus: true
 
@@ -581,7 +593,7 @@ Item {
           sourceSize.height: root.mediaPixelSize
           onStatusChanged: {
             if (loadedPath === "") return
-            if (status === Image.Ready) delete root.failedPaths[loadedPath]
+            if (status === Image.Ready) root.clearMediaFailure(loadedPath)
             else if (status === Image.Error) root.handleMediaFailure(loadedPath)
           }
         }
@@ -609,7 +621,7 @@ Item {
           }
           onStatusChanged: {
             if (loadedPath === "") return
-            if (status === Image.Ready) delete root.failedPaths[loadedPath]
+            if (status === Image.Ready) root.clearMediaFailure(loadedPath)
             else if (status === Image.Error) root.handleMediaFailure(loadedPath)
           }
         }
@@ -618,6 +630,7 @@ Item {
           id: videoItem
           anchors.fill: parent
           visible: false
+          property string loadedPath: ""
 
           MediaPlayer {
             id: videoPlayer
@@ -631,15 +644,15 @@ Item {
                 } else {
                   videoPlayer.play()
                 }
-              } else if ((mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia) && root.currentPath !== "") {
-                delete root.failedPaths[root.currentPath]
+              } else if ((mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia) && videoItem.loadedPath !== "") {
+                root.clearMediaFailure(videoItem.loadedPath)
               }
             }
             onErrorOccurred: {
               // Ignore noise from source swaps/stops; only a failure while a
               // video is actually on display marks it.
-              if (root.playbackActive && videoItem.visible && videoPlayer.source !== "") {
-                root.handleMediaFailure(root.currentPath)
+              if (root.playbackActive && videoItem.visible && videoPlayer.source !== "" && videoItem.loadedPath !== "") {
+                root.handleMediaFailure(videoItem.loadedPath)
               }
             }
           }
@@ -931,6 +944,15 @@ Item {
               rowHeight: 30
               onTriggered: {
                 root.effects = !root.effects
+                root.persistEntry()
+              }
+            }
+            MenuRow {
+              text: "Autoplay: " + (root.autoplay ? "on" : "off")
+              rowHeight: 30
+              onTriggered: {
+                root.autoplay = !root.autoplay
+                if (root.autoplay) root.restartTimer()
                 root.persistEntry()
               }
             }
