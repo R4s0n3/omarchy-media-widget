@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.ras.mediawidget",
   "name": "Media Widget",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "ras",
   "license": "GPL-3.0-or-later",
   "description": "Square slideshow widget for photos, GIFs and videos. Pick any folder and it plays your media on the desktop, synced or not.",

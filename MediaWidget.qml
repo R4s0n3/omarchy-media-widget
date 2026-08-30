@@ -519,34 +519,38 @@ Item {
   }
 
   // ---- window -------------------------------------------------------------
-  // Keep the layer surface the size of the card. A full-screen transparent
-  // overlay still costs a full-screen surface and, on some compositors, its
-  // input region can stall interaction/rendering in normal application
-  // windows even when a smaller mask is requested.
+  // Keep the layer surface stationary while dragging, as in 1.1.0, so global
+  // pointer deltas remain stable and the card stays under the cursor. The
+  // surface has no layer-shell keyboard capture and only the card is in its
+  // input region, so the overlay cannot hold input away from desktop apps.
   PanelWindow {
     id: window
     visible: root.opened && !root.locked
-    anchors { right: true; bottom: true }
-    margins { right: root.marginRight; bottom: root.marginBottom }
-    width: root.size
-    height: root.size
+    anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omarchy-mediawidget"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
+    mask: Region {
+      x: card.x
+      y: card.y
+      width: card.width
+      height: card.height
+    }
 
-    // Keyboard shortcuts only work after the card (or a control inside it)
-    // has deliberate focus; the context menu owns its keys while open.
-    Shortcut { sequence: "Space"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.togglePause() }
-    Shortcut { sequence: "Right"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.next() }
-    Shortcut { sequence: "Left"; enabled: root.opened && card.activeFocus && !contextMenu.visible; onActivated: root.prev() }
-    Shortcut { sequence: "Esc"; enabled: root.opened && card.activeFocus; onActivated: { if (contextMenu.visible) contextMenu.visible = false; else root.requestClose() } }
+    // Keyboard focus is intentionally disabled for this full-screen layer.
+    // Pointer controls and the context menu provide all widget interaction.
 
     Rectangle {
       id: card
-      anchors.fill: parent
+      width: root.size
+      height: root.size
       color: "transparent"
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      anchors.rightMargin: root.marginRight
+      anchors.bottomMargin: root.marginBottom
       clip: true
       focus: true
 
